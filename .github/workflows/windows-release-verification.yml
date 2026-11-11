@@ -306,7 +306,7 @@ jobs:
           if (-not $window) { throw 'Native application window was not observed' }
           $checks = @{ installer = 'passed'; appLaunch = 'passed'; runtimeVersions = 'passed'; authentication = 'not-run'; dynamips = 'not-run'; qemu = 'not-run'; labNetworking = 'not-run'; persistence = 'not-run'; shutdown = 'not-run' }
           $os = Get-CimInstance Win32_OperatingSystem
-          $report = @{ diagnosticOnly = ($env:LABSNRACKS_DIAGNOSTIC_PATCH -eq 'true'); finalInstallerQualified = ($env:LABSNRACKS_DIAGNOSTIC_PATCH -ne 'true'); schemaVersion = 1; version = $expected; platform = 'win32'; arch = 'x64'; artifactSha256 = $env:LABSNRACKS_INSTALLER_SHA256.ToLowerInvariant(); hostDescription = "$($os.Caption) $($os.Version) x64"; checks = $checks; installerSignature = (Get-Content (Join-Path $qa 'installer-signature.txt') -Raw).Trim(); appSignature = $appSignature; sourceCommit = $env:GITHUB_SHA; scope = 'Partial native smoke only: no sign-in bypass, vendor image or license was used; real lab acceptance remains not-run.' }
+          $report = @{ diagnosticOnly = ($env:LABSNRACKS_DIAGNOSTIC_PATCH -eq 'true'); finalInstallerQualified = $false; schemaVersion = 1; version = $expected; platform = 'win32'; arch = 'x64'; artifactSha256 = $env:LABSNRACKS_INSTALLER_SHA256.ToLowerInvariant(); hostDescription = "$($os.Caption) $($os.Version) x64"; checks = $checks; installerSignature = (Get-Content (Join-Path $qa 'installer-signature.txt') -Raw).Trim(); appSignature = $appSignature; sourceCommit = $env:GITHUB_SHA; scope = 'Partial native smoke only: no sign-in bypass, vendor image or license was used; real lab acceptance remains not-run.' }
           $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $qa 'native-windows-evidence.json') -Encoding utf8
       - name: Extract reviewed adapter and test real OpenWrt QEMU guests
         shell: pwsh
@@ -331,7 +331,7 @@ jobs:
           $report = Get-Content $reportFile -Raw | ConvertFrom-Json
           foreach ($check in @('qemu', 'labNetworking', 'persistence')) { $report.checks.$check = $qemu.checks.$check }
           $report | Add-Member -NotePropertyName qemuShutdown -NotePropertyValue $qemu.checks.qemuShutdown -Force
-          if ($report.diagnosticOnly) { $report.finalInstallerQualified = $false }
+          $report.finalInstallerQualified = (-not $report.diagnosticOnly -and $smokeExit -eq 0 -and $qemu.passed)
           $report.scope = 'Partial native installer and adapter smoke: exact installed adapter, publisher-checksummed OpenWrt serial boot, two-guest loopback UDP packets, peer stop isolation and disk overlay persistence. No authentication bypass, Google login, Cisco IOS/IOL image or license test. Application shutdown and full native UI lab flow remain not-run.'
           if ($report.diagnosticOnly) { $report.scope = 'DIAGNOSTIC ONLY: temporary installed QEMU has two additional publisher-checksummed SDL3/Vulkan DLLs absent from the reviewed EXE. ' + $report.scope }
           $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportFile -Encoding utf8
