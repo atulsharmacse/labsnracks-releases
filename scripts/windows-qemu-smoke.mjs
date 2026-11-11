@@ -65,6 +65,12 @@ if (process.argv[2] === '--probe-runtime') {
 }
 if (!installation || !extracted || !evidenceDirectory)
   throw new Error('Usage: node windows-qemu-smoke.mjs INSTALL_DIR EXTRACTED_ASAR EVIDENCE_DIR');
+// 0.2.1 diagnosis works around its known CR-discarding transport. Final
+// rebuilt candidates must prove raw xterm Enter through their installed fix.
+const diagnosticCrLf =
+  process.env.LABSNRACKS_DIAGNOSTIC_PATCH === 'true' &&
+  process.env.LABSNRACKS_EXPECTED_VERSION === '0.2.1';
+const enter = diagnosticCrLf ? '\r\n' : '\r';
 const root = await fs.mkdtemp(path.join(path.resolve(evidenceDirectory), 'qemu-native-'));
 const imageURL =
   'https://downloads.openwrt.org/releases/24.10.4/targets/x86/64/openwrt-24.10.4-x86-64-generic-ext4-combined.img.gz';
@@ -78,6 +84,7 @@ const digest = async (file) => {
 };
 const report = {
   diagnosticOnly: process.env.LABSNRACKS_DIAGNOSTIC_PATCH === 'true',
+  serialInput: diagnosticCrLf ? 'CRLF diagnostic workaround' : 'raw CR through installed adapter',
   schemaVersion: 1,
   platform: process.platform,
   arch: process.arch,
@@ -216,7 +223,7 @@ try {
       await wait(id, /Please press Enter|root@OpenWrt/);
       for (let n = 0; n < 180; n++) {
         if (/root@OpenWrt/.test(buffers.get(id) ?? '')) return;
-        engine.sendConsole(id, '\r\n');
+        engine.sendConsole(id, enter);
         await sleep(1000);
       }
       throw new Error('OpenWrt shell did not become ready.');
@@ -224,7 +231,10 @@ try {
     const command = async (id, text) => {
       const marker = randomUUID().replaceAll('-', '');
       buffers.set(id, '');
-      engine.sendConsole(id, `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s_END\\n' ${marker} "$r"\r\n`);
+      engine.sendConsole(
+        id,
+        `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s_END\\n' ${marker} "$r"${enter}`,
+      );
       const proof = new RegExp(`LR_${marker}_RC=(\\d+)_END`);
       await wait(id, proof, 30000);
       const output = buffers.get(id) ?? '';
