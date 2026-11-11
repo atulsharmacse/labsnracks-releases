@@ -216,7 +216,7 @@ try {
       await wait(id, /Please press Enter|root@OpenWrt/);
       for (let n = 0; n < 180; n++) {
         if (/root@OpenWrt/.test(buffers.get(id) ?? '')) return;
-        engine.sendConsole(id, '\r');
+        engine.sendConsole(id, '\r\n');
         await sleep(1000);
       }
       throw new Error('OpenWrt shell did not become ready.');
@@ -224,16 +224,20 @@ try {
     const command = async (id, text) => {
       const marker = randomUUID().replaceAll('-', '');
       buffers.set(id, '');
-      engine.sendConsole(id, `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s\\n' ${marker} "$r"\r`);
+      engine.sendConsole(id, `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s\\n' ${marker} "$r"\r\n`);
       await wait(id, new RegExp(`LR_${marker}_RC=\\d+\\r?\\n`), 30000);
       const output = buffers.get(id) ?? '';
       if (!output.includes(`LR_${marker}_RC=0`)) throw new Error('Guest command failed.');
       return output;
     };
+    report.stage = 'start-first-guest';
     await engine.start(project, one, settings, links(one, 0));
+    report.stage = 'start-second-guest';
     await engine.start(project, two, settings, links(two, 1));
+    report.stage = 'serial-shell-readiness';
     await Promise.all([ready(one.id), ready(two.id)]);
     report.checks.qemu = 'passed';
+    report.stage = 'address-and-packet-proof';
     await command(
       one.id,
       'ip addr flush dev eth1 && ip addr add 10.44.0.1/24 dev eth1 && ip link set eth1 up',
@@ -248,6 +252,7 @@ try {
       throw new Error('Bidirectional guest packet forwarding failed.');
     report.bidirectionalPackets = { oneToTwo: 3, twoToOne: 3 };
     report.checks.labNetworking = 'passed';
+    report.stage = 'overlay-persistence';
     await command(one.id, "printf 'labsnracks-%s\\n' persistent > /root/labsnracks-smoke && sync");
     await engine.stop(one.id);
     if (states.get(two.id) !== true) throw new Error('Stopping one guest affected its peer.');
@@ -274,6 +279,16 @@ try {
     }
   }
 } catch (error) {
+  report.serialMarkers = [...buffers.values()].map((text) => ({
+    bufferedCharacters: text.length,
+    pressEnter: /Please press Enter/.test(text),
+    rootPrompt: /root@/.test(text),
+    openWrt: /OpenWrt/.test(text),
+    busyBox: /BusyBox/.test(text),
+    loginPrompt: /login:/.test(text),
+    passwordPrompt: /[Pp]assword:/.test(text),
+    kernelPanic: /Kernel panic/.test(text),
+  }));
   report.error = error instanceof Error ? error.message : 'Native QEMU smoke failed.';
   const firstIncomplete = Object.keys(report.checks).find(
     (check) => report.checks[check] === 'not-run',
