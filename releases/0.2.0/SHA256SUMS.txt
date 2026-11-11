@@ -1,0 +1,4 @@
+0db642e73bc9110a058adc4e2993b472f17f8ff611499a169eae785c7ec3970c  LabsNracks.Setup.0.2.0.exe
+6bf0db40e1d99058e9da223e7341f2c2749c2613c202b1c13608c3120bcb7f76  LabsNracks.Setup.0.2.0.exe.blockmap
+e8d5ec9d1a2beb0850d5f89d22ab062e982af95e33c718ba06527732018b04b3  LabsNracks-0.2.0-arm64.dmg
+184c4ad819a82214ee52e26c1a496bbf74c1dcbee4ba00a3714aa8d2c37acd0b  LabsNracks-0.2.0-arm64.dmg.blockmap
