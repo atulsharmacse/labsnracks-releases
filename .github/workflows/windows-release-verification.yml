@@ -98,6 +98,7 @@ jobs:
               $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $url)
               $request.Headers.UserAgent.ParseAdd('LabsNracks-Windows-Verification/1')
               $request.Headers.Accept.ParseAdd('application/octet-stream')
+              if ($url.Host -eq 'api.github.com') { $request.Headers.Add('X-GitHub-Api-Version', '2026-03-10') }
               if ($authenticated -and $redirect -eq 0 -and $url.Host -eq 'api.github.com') { $request.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $env:LABSNRACKS_ASSET_TOKEN) }
               $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
               try {
@@ -106,7 +107,21 @@ jobs:
                   $url = [Uri]::new($url, $response.Headers.Location)
                   continue
                 }
-                if (-not $response.IsSuccessStatusCode) { throw "Asset download failed with HTTP $([int]$response.StatusCode)" }
+                if (-not $response.IsSuccessStatusCode) {
+                  $reason = 'unclassified'
+                  if ($url.Host -eq 'api.github.com' -and $response.Content.Headers.ContentLength -ge 0 -and $response.Content.Headers.ContentLength -le 65536) {
+                    try {
+                      $failure = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+                      if ($failure.message -match 'Resource not accessible by integration') { $reason = 'integration_access_denied' }
+                      elseif ($failure.message -match 'rate limit') { $reason = 'api_rate_limited' }
+                      elseif ($failure.message -match 'Not Found') { $reason = 'asset_not_visible' }
+                      elseif ($failure.message -match 'Bad credentials') { $reason = 'job_token_rejected' }
+                    } catch { $reason = 'non_json_api_error' }
+                  }
+                  # Only fixed classifications and a public hostname are emitted.
+                  # Never print response bodies, tokens, redirect queries or URLs.
+                  throw "Asset download failed at $($url.Host), redirect $redirect, HTTP $([int]$response.StatusCode), reason $reason"
+                }
                 $incoming = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                 $outgoing = [IO.File]::Create($installer)
                 try {
