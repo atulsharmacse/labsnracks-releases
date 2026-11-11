@@ -24,6 +24,11 @@ on:
         required: true
         default: false
         type: boolean
+      diagnostic_sdl3_patch:
+        description: Diagnose SDL3 dependency fix in temporary install (never final installer acceptance)
+        required: true
+        default: false
+        type: boolean
 permissions:
   contents: read
 jobs:
@@ -36,6 +41,7 @@ jobs:
       LABSNRACKS_EXPECTED_VERSION: ${{ inputs.expected_version }}
       LABSNRACKS_INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
       LABSNRACKS_ALLOW_UNSIGNED: ${{ inputs.allow_unsigned_test }}
+      LABSNRACKS_DIAGNOSTIC_PATCH: ${{ inputs.diagnostic_sdl3_patch }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -177,6 +183,53 @@ jobs:
             $runtimeEvidence += @{ kind = $entry.Kind; version = $manifest.version; verifiedFiles = $files.Count; manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant() }
           }
           $runtimeEvidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $qa 'runtime-file-evidence.json') -Encoding utf8
+          # Opt-in dependency diagnosis only. Frozen installer bytes and every
+          # manifest entry were verified above; these DLLs are NOT in that EXE.
+          if ($env:LABSNRACKS_DIAGNOSTIC_PATCH -eq 'true') {
+            $asar = Join-Path $installDir 'resources/app.asar'
+            $asarBefore = (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash.ToLowerInvariant()
+            $patches = @(
+              @{ Url='https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-sdl3-3.4.20-1-any.pkg.tar.zst'; ArchiveSha='4a44381560c433ff42da3a6aff788fba2bba84a44b7f63ea396dec9c1cf79f78'; Member='ucrt64/bin/SDL3.dll'; FileSha='fcf8a99a019c8d2ed947219e7e768aae1f9cef7219ad93c0ab0007b63db1a6f1'; Name='SDL3.dll' },
+              @{ Url='https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-loader-1~1.4.363.0-1-any.pkg.tar.zst'; ArchiveSha='065076fe13d39ab97eea4740596426d5ae741b5044e48e1c9495d04835c92dbe'; Member='ucrt64/bin/vulkan-1.dll'; FileSha='31862137c4179dcdbba782760f3e401f9fb526477947079d7f63987864f9b0eb'; Name='vulkan-1.dll' }
+            )
+            $patchEvidence = @()
+            $patchClient = [Net.Http.HttpClient]::new()
+            $patchClient.Timeout = [TimeSpan]::FromSeconds(90)
+            try {
+              foreach ($patch in $patches) {
+                $archive = Join-Path $qa ($patch.Name + '.pkg.tar.zst')
+                $response = $patchClient.GetAsync($patch.Url, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                try {
+                  if (-not $response.IsSuccessStatusCode -or $response.RequestMessage.RequestUri.AbsoluteUri -ne $patch.Url) { throw 'Official MSYS2 patch download failed or redirected' }
+                  $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                  $outputStream = [IO.File]::Open($archive, [IO.FileMode]::CreateNew)
+                  try {
+                    $buffer = [byte[]]::new(65536); $size = 0L
+                    while (($count = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                      $size += $count
+                      if ($size -gt 67108864) { throw 'Oversized MSYS2 diagnostic archive' }
+                      $outputStream.Write($buffer, 0, $count)
+                    }
+                  } finally { $outputStream.Dispose(); $inputStream.Dispose() }
+                } finally { $response.Dispose() }
+                if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $patch.ArchiveSha) { throw 'MSYS2 diagnostic archive checksum mismatch' }
+                $extract = Join-Path $qa ($patch.Name + '-extract')
+                New-Item -ItemType Directory -Path $extract | Out-Null
+                tar -xf $archive -C $extract $patch.Member
+                if ($LASTEXITCODE -ne 0) { throw 'Cannot extract the single reviewed MSYS2 diagnostic DLL' }
+                $source = Join-Path $extract $patch.Member
+                if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne $patch.FileSha) { throw 'MSYS2 diagnostic DLL checksum mismatch' }
+                $target = Join-Path $installDir ('resources/engines/qemu/win32-x64/bin/' + $patch.Name)
+                if (Test-Path -LiteralPath $target) { throw 'Diagnostic patch must not replace a frozen installer file' }
+                Copy-Item -LiteralPath $source -Destination $target
+                $patchEvidence += @{ file=$patch.Name; url=$patch.Url; archiveSha256=$patch.ArchiveSha; sha256=$patch.FileSha }
+              }
+            } finally { $patchClient.Dispose() }
+            $asarAfter = (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($asarAfter -ne $asarBefore) { throw 'Diagnostic patch changed the reviewed application archive' }
+            @{ diagnosticOnly=$true; finalInstallerQualified=$false; appAsarUnchanged=$true; appAsarSha256=$asarAfter; patches=$patchEvidence } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $qa 'diagnostic-runtime-patch.json') -Encoding utf8
+            Write-Host 'DIAGNOSTIC ONLY: added two publisher-checksummed runtime DLLs; this does not qualify the frozen installer.'
+          }
           # Read only text from an error window owned by the probed process.
           # No desktop screenshot, unrelated windows, or button presses.
           try { Add-Type -TypeDefinition @'
@@ -253,7 +306,7 @@ jobs:
           if (-not $window) { throw 'Native application window was not observed' }
           $checks = @{ installer = 'passed'; appLaunch = 'passed'; runtimeVersions = 'passed'; authentication = 'not-run'; dynamips = 'not-run'; qemu = 'not-run'; labNetworking = 'not-run'; persistence = 'not-run'; shutdown = 'not-run' }
           $os = Get-CimInstance Win32_OperatingSystem
-          $report = @{ schemaVersion = 1; version = $expected; platform = 'win32'; arch = 'x64'; artifactSha256 = $env:LABSNRACKS_INSTALLER_SHA256.ToLowerInvariant(); hostDescription = "$($os.Caption) $($os.Version) x64"; checks = $checks; installerSignature = (Get-Content (Join-Path $qa 'installer-signature.txt') -Raw).Trim(); appSignature = $appSignature; sourceCommit = $env:GITHUB_SHA; scope = 'Partial native smoke only: no sign-in bypass, vendor image or license was used; real lab acceptance remains not-run.' }
+          $report = @{ diagnosticOnly = ($env:LABSNRACKS_DIAGNOSTIC_PATCH -eq 'true'); finalInstallerQualified = ($env:LABSNRACKS_DIAGNOSTIC_PATCH -ne 'true'); schemaVersion = 1; version = $expected; platform = 'win32'; arch = 'x64'; artifactSha256 = $env:LABSNRACKS_INSTALLER_SHA256.ToLowerInvariant(); hostDescription = "$($os.Caption) $($os.Version) x64"; checks = $checks; installerSignature = (Get-Content (Join-Path $qa 'installer-signature.txt') -Raw).Trim(); appSignature = $appSignature; sourceCommit = $env:GITHUB_SHA; scope = 'Partial native smoke only: no sign-in bypass, vendor image or license was used; real lab acceptance remains not-run.' }
           $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $qa 'native-windows-evidence.json') -Encoding utf8
       - name: Extract reviewed adapter and test real OpenWrt QEMU guests
         shell: pwsh
@@ -278,7 +331,9 @@ jobs:
           $report = Get-Content $reportFile -Raw | ConvertFrom-Json
           foreach ($check in @('qemu', 'labNetworking', 'persistence')) { $report.checks.$check = $qemu.checks.$check }
           $report | Add-Member -NotePropertyName qemuShutdown -NotePropertyValue $qemu.checks.qemuShutdown -Force
+          if ($report.diagnosticOnly) { $report.finalInstallerQualified = $false }
           $report.scope = 'Partial native installer and adapter smoke: exact installed adapter, publisher-checksummed OpenWrt serial boot, two-guest loopback UDP packets, peer stop isolation and disk overlay persistence. No authentication bypass, Google login, Cisco IOS/IOL image or license test. Application shutdown and full native UI lab flow remain not-run.'
+          if ($report.diagnosticOnly) { $report.scope = 'DIAGNOSTIC ONLY: temporary installed QEMU has two additional publisher-checksummed SDL3/Vulkan DLLs absent from the reviewed EXE. ' + $report.scope }
           $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportFile -Encoding utf8
           if ($smokeExit -ne 0 -or -not $qemu.passed) { throw 'Native QEMU qualification failed; inspect sanitized evidence' }
       - name: Stop only this installed test application and uninstall it
