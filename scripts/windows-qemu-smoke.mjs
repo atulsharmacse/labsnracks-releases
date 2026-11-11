@@ -77,6 +77,7 @@ const digest = async (file) => {
   return hash.digest('hex');
 };
 const report = {
+  diagnosticOnly: process.env.LABSNRACKS_DIAGNOSTIC_PATCH === 'true',
   schemaVersion: 1,
   platform: process.platform,
   arch: process.arch,
