@@ -224,10 +224,12 @@ try {
     const command = async (id, text) => {
       const marker = randomUUID().replaceAll('-', '');
       buffers.set(id, '');
-      engine.sendConsole(id, `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s\\n' ${marker} "$r"\r\n`);
-      await wait(id, new RegExp(`LR_${marker}_RC=\\d+\\r?\\n`), 30000);
+      engine.sendConsole(id, `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s_END\\n' ${marker} "$r"\r\n`);
+      const proof = new RegExp(`LR_${marker}_RC=(\\d+)_END`);
+      await wait(id, proof, 30000);
       const output = buffers.get(id) ?? '';
-      if (!output.includes(`LR_${marker}_RC=0`)) throw new Error('Guest command failed.');
+      if (proof.exec(output)?.[1] !== '0') throw new Error('Guest command failed.');
+      report.completedCommands = (report.completedCommands ?? 0) + 1;
       return output;
     };
     report.stage = 'start-first-guest';
