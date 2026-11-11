@@ -212,7 +212,7 @@ try {
     report.distinctUdpPorts = ports[0] !== ports[1];
     for (const socket of sockets) await new Promise((resolve) => socket.close(resolve));
     const links = (n, index) => [
-      { nodeId: n.id, port: 'eth1', local: ports[index], remote: ports[1 - index] },
+      { nodeId: n.id, port: 'eth2', local: ports[index], remote: ports[1 - index] },
     ];
     const wait = async (id, pattern, timeout = 180000) => {
       const deadline = Date.now() + timeout;
@@ -244,10 +244,7 @@ try {
       const marker = randomUUID().replaceAll('-', '');
       buffers.set(id, '');
       lastCommand = { id, marker, text };
-      await send(
-        id,
-        `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s_END\\n' ${marker} "$r"${enter}`,
-      );
+      await send(id, `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s_END\\n' ${marker} "$r"${enter}`);
       const proof = new RegExp(`LR_${marker}_RC=(\\d+)_END`);
       await wait(id, proof, 30000);
       const output = buffers.get(id) ?? '';
@@ -265,11 +262,11 @@ try {
     report.stage = 'address-and-packet-proof';
     await command(
       one.id,
-      'ip addr flush dev eth1 && ip addr add 10.44.0.1/24 dev eth1 && ip link set eth1 up',
+      'ip addr flush dev eth2 && ip addr add 10.44.0.1/24 dev eth2 && ip link set eth2 up',
     );
     await command(
       two.id,
-      'ip addr flush dev eth1 && ip addr add 10.44.0.2/24 dev eth1 && ip link set eth1 up',
+      'ip addr flush dev eth2 && ip addr add 10.44.0.2/24 dev eth2 && ip link set eth2 up',
     );
     const pingOne = await command(one.id, 'ping -c 3 -W 3 10.44.0.2');
     const pingTwo = await command(two.id, 'ping -c 3 -W 3 10.44.0.1');
