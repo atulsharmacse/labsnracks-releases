@@ -177,6 +177,36 @@ jobs:
             $runtimeEvidence += @{ kind = $entry.Kind; version = $manifest.version; verifiedFiles = $files.Count; manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant() }
           }
           $runtimeEvidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $qa 'runtime-file-evidence.json') -Encoding utf8
+          # Read only text from an error window owned by the probed process.
+          # No desktop screenshot, unrelated windows, or button presses.
+          try { Add-Type -TypeDefinition @'
+          using System;
+          using System.Text;
+          using System.Collections.Generic;
+          using System.Runtime.InteropServices;
+          public static class LabsNracksOwnedWindowText {
+            private delegate bool EnumProc(IntPtr window, IntPtr parameter);
+            [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumProc callback, IntPtr parameter);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int maximum);
+            [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+            public static string[] Read(IntPtr window, uint expectedProcess) {
+              uint owner; GetWindowThreadProcessId(window, out owner);
+              if (window == IntPtr.Zero || owner != expectedProcess) return new string[0];
+              var result = new List<string>();
+              EnumProc callback = (child, unused) => {
+                uint childOwner; GetWindowThreadProcessId(child, out childOwner);
+                if (childOwner == expectedProcess) {
+                  var text = new StringBuilder(1024);
+                  if (GetWindowText(child, text, text.Capacity) > 0) result.Add(text.ToString());
+                }
+                return result.Count < 32;
+              };
+              EnumChildWindows(window, callback, IntPtr.Zero);
+              return result.ToArray();
+            }
+          }
+          '@
+          } catch { Write-Host 'Optional owned-window text diagnostics are unavailable; runtime gates remain active.' }
           $runtimeChecks = @(
             @{ Path = 'resources/engines/win32-x64/dynamips.exe'; Pattern = 'Dynamips|Cisco Router Simulation Platform' },
             @{ Path = 'resources/engines/qemu/win32-x64/bin/qemu-img.exe'; Pattern = 'qemu-img version' },
@@ -194,11 +224,16 @@ jobs:
               $ownedProbe = Get-Process -Id $probe.Id -ErrorAction SilentlyContinue
               $moduleNames = @()
               try { $moduleNames = @($ownedProbe.Modules | Select-Object -First 128 | ForEach-Object { $_.ModuleName }) } catch {}
+              $ownedText = @()
+              try { $ownedText = @([LabsNracksOwnedWindowText]::Read($ownedProbe.MainWindowHandle, [uint32]$probe.Id)) } catch {}
               $title = if ($ownedProbe) { ($ownedProbe.MainWindowTitle -replace '[\x00-\x1f]', ' ') } else { '' }
               if ($title.Length -gt 256) { $title = $title.Substring(0, 256) }
-              @{ binary = $binaryName; status = 'timeout'; elapsedMs = $timer.ElapsedMilliseconds; ownedWindowTitle = $title; loadedModuleNames = $moduleNames } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $qa ($binaryName + '.probe.json')) -Encoding utf8
+              @{ binary = $binaryName; status = 'timeout'; elapsedMs = $timer.ElapsedMilliseconds; ownedWindowTitle = $title; ownedWindowText = $ownedText; loadedModuleNames = $moduleNames } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $qa ($binaryName + '.probe.json')) -Encoding utf8
               Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue
-              throw "Bundled runtime version probe timed out after 90 seconds: $binaryName"
+              node scripts/windows-qemu-smoke.mjs --probe-runtime $file $qa
+              if ($LASTEXITCODE -ne 0) { throw "Bundled runtime failed both PowerShell and adapter-faithful Node probes: $binaryName" }
+              Write-Host "Runtime identifies correctly through adapter-faithful Node transport: $binaryName"
+              continue
             }
             @{ binary = $binaryName; status = 'exited'; elapsedMs = $timer.ElapsedMilliseconds; exitCode = $probe.ExitCode } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $qa ($binaryName + '.probe.json')) -Encoding utf8
             if ($probe.ExitCode -notin @(0, 1) -or ($runtime.Path -notlike '*dynamips.exe' -and $probe.ExitCode -ne 0)) { throw 'Bundled runtime version probe failed' }
