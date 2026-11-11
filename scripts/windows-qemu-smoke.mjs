@@ -86,7 +86,7 @@ const digest = async (file) => {
 const report = {
   diagnosticOnly: process.env.LABSNRACKS_DIAGNOSTIC_PATCH === 'true',
   serialInput: diagnosticCrLf
-    ? 'CRLF paced 2ms diagnostic workaround'
+    ? 'CRLF paced 10ms diagnostic workaround'
     : 'raw CR through installed adapter',
   schemaVersion: 1,
   platform: process.platform,
@@ -227,7 +227,7 @@ try {
       if (diagnosticCrLf) {
         for (const character of input) {
           engine.sendConsole(id, character);
-          await sleep(2);
+          await sleep(10);
         }
       } else engine.sendConsole(id, input);
     };
