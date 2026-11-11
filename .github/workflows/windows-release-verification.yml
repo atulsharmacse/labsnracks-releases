@@ -179,8 +179,8 @@ jobs:
           $runtimeEvidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $qa 'runtime-file-evidence.json') -Encoding utf8
           $runtimeChecks = @(
             @{ Path = 'resources/engines/win32-x64/dynamips.exe'; Pattern = 'Dynamips|Cisco Router Simulation Platform' },
-            @{ Path = 'resources/engines/qemu/win32-x64/bin/qemu-system-x86_64.exe'; Pattern = 'QEMU emulator version' },
-            @{ Path = 'resources/engines/qemu/win32-x64/bin/qemu-img.exe'; Pattern = 'qemu-img version' }
+            @{ Path = 'resources/engines/qemu/win32-x64/bin/qemu-img.exe'; Pattern = 'qemu-img version' },
+            @{ Path = 'resources/engines/qemu/win32-x64/bin/qemu-system-x86_64.exe'; Pattern = 'QEMU emulator version' }
           )
           foreach ($runtime in $runtimeChecks) {
             $file = Join-Path $installDir $runtime.Path
