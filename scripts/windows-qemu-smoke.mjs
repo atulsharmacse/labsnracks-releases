@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { createGunzip } from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
-import { Readable } from 'node:stream';
+import https from 'node:https';
 import dgram from 'node:dgram';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { execFile } from 'node:child_process';
@@ -97,11 +97,28 @@ const buffers = new Map();
 const states = new Map();
 const errors = new Map();
 try {
-  const response = await fetch(imageURL, {
-    redirect: 'error',
-    signal: AbortSignal.timeout(120000),
+  // Raw publisher bytes: fetch transparently decodes Content-Encoding and
+  // can turn a .gz asset into an ambiguous second decompression on this host.
+  const response = await new Promise((resolve, reject) => {
+    const request = https.get(
+      imageURL,
+      { signal: AbortSignal.timeout(120000), headers: { 'Accept-Encoding': 'identity' } },
+      resolve,
+    );
+    request.once('error', reject);
   });
-  if (!response.ok || !response.body) throw new Error('Official OpenWrt image download failed.');
+  if (response.statusCode !== 200) {
+    response.destroy();
+    throw new Error('Official OpenWrt image download failed or redirected.');
+  }
+  const contentLength = response.headers['content-length'];
+  if (
+    contentLength !== undefined &&
+    (!/^\d+$/.test(contentLength) || Number(contentLength) > 32 * 1024 * 1024)
+  ) {
+    response.destroy();
+    throw new Error('Official OpenWrt image download exceeds its bound.');
+  }
   let downloaded = 0;
   const bounded = async function* (chunks) {
     for await (const chunk of chunks) {
@@ -110,11 +127,7 @@ try {
       yield chunk;
     }
   };
-  await pipeline(
-    Readable.fromWeb(response.body),
-    bounded,
-    createWriteStream(compressed, { flags: 'wx' }),
-  );
+  await pipeline(response, bounded, createWriteStream(compressed, { flags: 'wx' }));
   if ((await digest(compressed)) !== publisherSha256)
     throw new Error('OpenWrt publisher SHA-256 mismatch.');
   let expanded = 0;
