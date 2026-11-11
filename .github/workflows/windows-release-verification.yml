@@ -1,0 +1,239 @@
+name: Native Windows release verification
+on:
+  workflow_dispatch:
+    inputs:
+      installer_url:
+        description: Existing public EXE URL from this repository's GitHub Releases
+        required: false
+        type: string
+      installer_asset_id:
+        description: Same-repository draft release asset ID (alternative to public URL)
+        required: false
+        type: string
+      expected_version:
+        description: Exact reviewed installer application version
+        required: true
+        default: '0.2.0'
+        type: string
+      installer_sha256:
+        description: Reviewed SHA-256 of that exact EXE
+        required: true
+        type: string
+      allow_unsigned_test:
+        description: Test an unsigned development installer (does not approve public beta publication)
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  native-windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      LABSNRACKS_INSTALLER_URL: ${{ inputs.installer_url }}
+      LABSNRACKS_INSTALLER_ASSET_ID: ${{ inputs.installer_asset_id }}
+      LABSNRACKS_EXPECTED_VERSION: ${{ inputs.expected_version }}
+      LABSNRACKS_INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+      LABSNRACKS_ALLOW_UNSIGNED: ${{ inputs.allow_unsigned_test }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Detect optional private source checkout
+        id: source
+        shell: pwsh
+        run: |
+          "present=$((Test-Path -LiteralPath package.json).ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+      - uses: pnpm/action-setup@v4
+        if: steps.source.outputs.present == 'true'
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Source and portable release checks
+        if: steps.source.outputs.present == 'true'
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency install failed' }
+          pnpm typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'Typecheck failed' }
+          node --import tsx --test tests/release-manifest.test.ts tests/floating-console.test.ts tests/device-icons.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Portable regression checks failed' }
+          pnpm build
+          if ($LASTEXITCODE -ne 0) { throw 'Source build failed' }
+      - name: Verify exact public installer bytes and trust status
+        shell: pwsh
+        env:
+          LABSNRACKS_ASSET_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:LABSNRACKS_EXPECTED_VERSION -notmatch '^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$') { throw 'Provide the reviewed application version' }
+          if ([bool]$env:LABSNRACKS_INSTALLER_URL -eq [bool]$env:LABSNRACKS_INSTALLER_ASSET_ID) { throw 'Provide exactly one public URL or same-repository draft asset ID' }
+          $authenticated = $false
+          if ($env:LABSNRACKS_INSTALLER_ASSET_ID) {
+            if ($env:LABSNRACKS_INSTALLER_ASSET_ID -notmatch '^[1-9][0-9]{0,19}$') { throw 'Invalid draft asset ID' }
+            $url = [Uri]("https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/assets/$env:LABSNRACKS_INSTALLER_ASSET_ID")
+            $authenticated = $true
+          } else {
+            $url = [Uri]$env:LABSNRACKS_INSTALLER_URL
+            $prefix = '/' + $env:GITHUB_REPOSITORY + '/releases/download/'
+            if ($url.Scheme -ne 'https' -or $url.Host -ne 'github.com' -or $url.UserInfo -or $url.Query -or $url.Fragment -or -not $url.IsDefaultPort -or -not $url.AbsolutePath.StartsWith($prefix) -or -not $url.AbsolutePath.EndsWith('.exe')) { throw 'Use an exact public EXE asset from this repository' }
+          }
+          if ($env:LABSNRACKS_INSTALLER_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Provide the reviewed EXE SHA-256' }
+          $qa = Join-Path $env:RUNNER_TEMP 'labsnracks-native-release'
+          New-Item -ItemType Directory -Force -Path $qa | Out-Null
+          $installer = Join-Path $qa 'reviewed-installer.exe'
+          # Redirects are followed manually. The job token is sent only to the
+          # initial same-repository api.github.com endpoint, never to asset CDNs.
+          $handler = [Net.Http.HttpClientHandler]::new()
+          $handler.AllowAutoRedirect = $false
+          $client = [Net.Http.HttpClient]::new($handler)
+          $client.Timeout = [TimeSpan]::FromMinutes(5)
+          try {
+            for ($redirect = 0; $redirect -le 5; $redirect++) {
+              if ($url.Scheme -ne 'https' -or -not $url.IsDefaultPort -or $url.UserInfo -or $url.Fragment -or $url.Host -notin @('api.github.com', 'github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com')) { throw 'Unsafe asset download redirect' }
+              $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $url)
+              $request.Headers.UserAgent.ParseAdd('LabsNracks-Windows-Verification/1')
+              $request.Headers.Accept.ParseAdd('application/octet-stream')
+              if ($authenticated -and $redirect -eq 0 -and $url.Host -eq 'api.github.com') { $request.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $env:LABSNRACKS_ASSET_TOKEN) }
+              $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+              try {
+                if ([int]$response.StatusCode -in @(301, 302, 303, 307, 308)) {
+                  if (-not $response.Headers.Location -or $redirect -eq 5) { throw 'Asset redirect limit exceeded' }
+                  $url = [Uri]::new($url, $response.Headers.Location)
+                  continue
+                }
+                if (-not $response.IsSuccessStatusCode) { throw "Asset download failed with HTTP $([int]$response.StatusCode)" }
+                $incoming = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $outgoing = [IO.File]::Create($installer)
+                try {
+                  $buffer = [byte[]]::new(1048576)
+                  $total = 0L
+                  while (($count = $incoming.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $total += $count
+                    if ($total -gt 2147483647) { throw 'Installer exceeds release asset limit' }
+                    $outgoing.Write($buffer, 0, $count)
+                  }
+                } finally { $incoming.Dispose(); $outgoing.Dispose() }
+                break
+              } finally { $response.Dispose(); $request.Dispose() }
+            }
+          } finally { $client.Dispose(); $handler.Dispose() }
+          $actual = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:LABSNRACKS_INSTALLER_SHA256.ToLowerInvariant()) { throw 'Installer SHA-256 mismatch; it will not be executed' }
+          $signature = (Get-AuthenticodeSignature -LiteralPath $installer).Status.ToString()
+          if ($signature -ne 'Valid' -and -not ($signature -eq 'NotSigned' -and $env:LABSNRACKS_ALLOW_UNSIGNED -eq 'true')) { throw "Installer trust rejected: $signature" }
+          Set-Content -LiteralPath (Join-Path $qa 'installer-signature.txt') -Value $signature
+      - name: Install, check bundled processes and open normal account entry
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $qa = Join-Path $env:RUNNER_TEMP 'labsnracks-native-release'
+          $installer = Join-Path $qa 'reviewed-installer.exe'
+          $installDir = Join-Path $qa 'LabsNracks Native QA'
+          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -PassThru -Wait
+          if ($install.ExitCode -ne 0) { throw "Installer exited $($install.ExitCode)" }
+          $app = Join-Path $installDir 'LabsNracks.exe'
+          if (-not (Test-Path -LiteralPath $app -PathType Leaf)) { throw 'Installed application is missing' }
+          $expected = $env:LABSNRACKS_EXPECTED_VERSION
+          if ((Test-Path package.json) -and (Get-Content package.json -Raw | ConvertFrom-Json).version -ne $expected) { throw 'Source and reviewed installer versions differ' }
+          $actualVersion = (Get-Item -LiteralPath $app).VersionInfo.ProductVersion
+          if ($actualVersion -notmatch ('^' + [Regex]::Escape($expected) + '(?:\.0)?(?:\s|$)')) { throw "Installed version $actualVersion differs from source $expected" }
+          $appSignature = (Get-AuthenticodeSignature -LiteralPath $app).Status.ToString()
+          if ($appSignature -ne 'Valid' -and -not ($appSignature -eq 'NotSigned' -and $env:LABSNRACKS_ALLOW_UNSIGNED -eq 'true')) { throw "Application trust rejected: $appSignature" }
+          $runtimeEvidence = @()
+          foreach ($entry in @(@{ Directory = 'resources/engines/win32-x64'; Kind = 'dynamips' }, @{ Directory = 'resources/engines/qemu/win32-x64'; Kind = 'qemu' })) {
+            $runtimeDir = Join-Path $installDir $entry.Directory
+            $manifestPath = Join-Path $runtimeDir 'manifest.json'
+            if ((Get-Item -LiteralPath $manifestPath).Length -gt 2097152) { throw 'Oversized bundled runtime manifest' }
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.platform -ne 'win32' -or $manifest.arch -ne 'x64') { throw 'Wrong bundled runtime target' }
+            $files = if ($entry.Kind -eq 'dynamips') { $manifest.runtimeFiles } else { $manifest.files }
+            if (-not $files -or $files.Count -gt 2048) { throw 'Invalid bundled runtime file manifest' }
+            foreach ($file in $files) {
+              $relative = if ($entry.Kind -eq 'dynamips') { $file.file } else { $file.path }
+              if (-not $relative -or $relative -match '[:\\]' -or $relative.StartsWith('/') -or ($relative.Split('/') | Where-Object { $_ -in @('', '.', '..') }) -or $file.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Unsafe bundled runtime manifest entry' }
+              $member = Join-Path $runtimeDir $relative
+              if ((Get-FileHash -LiteralPath $member -Algorithm SHA256).Hash.ToLowerInvariant() -ne $file.sha256) { throw 'Bundled runtime file checksum mismatch' }
+            }
+            $runtimeEvidence += @{ kind = $entry.Kind; version = $manifest.version; verifiedFiles = $files.Count; manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          $runtimeEvidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $qa 'runtime-file-evidence.json') -Encoding utf8
+          $runtimeChecks = @(
+            @{ Path = 'resources/engines/win32-x64/dynamips.exe'; Pattern = 'Dynamips|Cisco Router Simulation Platform' },
+            @{ Path = 'resources/engines/qemu/win32-x64/bin/qemu-system-x86_64.exe'; Pattern = 'QEMU emulator version' },
+            @{ Path = 'resources/engines/qemu/win32-x64/bin/qemu-img.exe'; Pattern = 'qemu-img version' }
+          )
+          foreach ($runtime in $runtimeChecks) {
+            $file = Join-Path $installDir $runtime.Path
+            $out = Join-Path $qa ([IO.Path]::GetFileName($file) + '.stdout.txt')
+            $err = Join-Path $qa ([IO.Path]::GetFileName($file) + '.stderr.txt')
+            $probe = Start-Process -FilePath $file -ArgumentList '--version' -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+            if (-not $probe.WaitForExit(20000)) { Stop-Process -Id $probe.Id -Force; throw 'Bundled runtime version probe timed out' }
+            if ($probe.ExitCode -notin @(0, 1) -or ($runtime.Path -notlike '*dynamips.exe' -and $probe.ExitCode -ne 0)) { throw 'Bundled runtime version probe failed' }
+            $text = (Get-Content $out -Raw) + (Get-Content $err -Raw)
+            if ($text -notmatch $runtime.Pattern) { throw "Bundled runtime did not identify itself: $($runtime.Path)" }
+          }
+          $process = Start-Process -FilePath $app -PassThru
+          Set-Content -LiteralPath (Join-Path $qa 'app-pid.txt') -Value $process.Id
+          $window = $false
+          for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            Start-Sleep -Seconds 1
+            $owned = Get-Process -Name 'LabsNracks' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $app }
+            if ($owned | Where-Object { $_.MainWindowHandle -ne 0 }) { $window = $true; break }
+            $process.Refresh()
+            if ($process.HasExited -and -not $owned) { throw 'Application exited before showing its account entry window' }
+          }
+          if (-not $window) { throw 'Native application window was not observed' }
+          $checks = @{ installer = 'passed'; appLaunch = 'passed'; runtimeVersions = 'passed'; authentication = 'not-run'; dynamips = 'not-run'; qemu = 'not-run'; labNetworking = 'not-run'; persistence = 'not-run'; shutdown = 'not-run' }
+          $os = Get-CimInstance Win32_OperatingSystem
+          $report = @{ schemaVersion = 1; version = $expected; platform = 'win32'; arch = 'x64'; artifactSha256 = $env:LABSNRACKS_INSTALLER_SHA256.ToLowerInvariant(); hostDescription = "$($os.Caption) $($os.Version) x64"; checks = $checks; installerSignature = (Get-Content (Join-Path $qa 'installer-signature.txt') -Raw).Trim(); appSignature = $appSignature; sourceCommit = $env:GITHUB_SHA; scope = 'Partial native smoke only: no sign-in bypass, vendor image or license was used; real lab acceptance remains not-run.' }
+          $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $qa 'native-windows-evidence.json') -Encoding utf8
+      - name: Extract reviewed adapter and test real OpenWrt QEMU guests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $qa = Join-Path $env:RUNNER_TEMP 'labsnracks-native-release'
+          $tools = Join-Path $qa 'asar-tools'
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+          $metadata = npm pack '@electron/asar@3.4.1' --json --pack-destination $tools | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $metadata.integrity -ne 'sha512-i4/rNPRS84t0vSRa2HorerGRXWyF4vThfHesw0dmcWHp+cspK743UanA0suA5Q5y8kzY2y6YKrvbIUn69BCAiA==') { throw 'Pinned official ASAR extraction package integrity mismatch' }
+          $archive = Join-Path $tools $metadata.filename
+          npm install --prefix $tools --ignore-scripts --no-audit --no-fund $archive
+          if ($LASTEXITCODE -ne 0) { throw 'ASAR extraction tool installation failed' }
+          $installDir = Join-Path $qa 'LabsNracks Native QA'
+          $extracted = Join-Path $qa 'reviewed-app-extracted'
+          node (Join-Path $tools 'node_modules/@electron/asar/bin/asar.js') extract (Join-Path $installDir 'resources/app.asar') $extracted
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed installer ASAR extraction failed' }
+          node scripts/windows-qemu-smoke.mjs $installDir $extracted $qa
+          $smokeExit = $LASTEXITCODE
+          $qemu = Get-Content (Join-Path $qa 'qemu-native-evidence.json') -Raw | ConvertFrom-Json
+          $reportFile = Join-Path $qa 'native-windows-evidence.json'
+          $report = Get-Content $reportFile -Raw | ConvertFrom-Json
+          foreach ($check in @('qemu', 'labNetworking', 'persistence')) { $report.checks.$check = $qemu.checks.$check }
+          $report | Add-Member -NotePropertyName qemuShutdown -NotePropertyValue $qemu.checks.qemuShutdown -Force
+          $report.scope = 'Partial native installer and adapter smoke: exact installed adapter, publisher-checksummed OpenWrt serial boot, two-guest loopback UDP packets, peer stop isolation and disk overlay persistence. No authentication bypass, Google login, Cisco IOS/IOL image or license test. Application shutdown and full native UI lab flow remain not-run.'
+          $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportFile -Encoding utf8
+          if ($smokeExit -ne 0 -or -not $qemu.passed) { throw 'Native QEMU qualification failed; inspect sanitized evidence' }
+      - name: Stop only this installed test application and uninstall it
+        if: always()
+        shell: pwsh
+        run: |
+          $qa = Join-Path $env:RUNNER_TEMP 'labsnracks-native-release'
+          $installDir = Join-Path $qa 'LabsNracks Native QA'
+          Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installDir + '\', [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter '*Uninstall*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($uninstaller) { Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -Wait }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-windows-release-evidence
+          path: |
+            ${{ runner.temp }}/labsnracks-native-release/*.json
+            ${{ runner.temp }}/labsnracks-native-release/*.stdout.txt
+            ${{ runner.temp }}/labsnracks-native-release/*.stderr.txt
+          if-no-files-found: warn
+          retention-days: 7
