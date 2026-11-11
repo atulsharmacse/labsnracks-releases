@@ -11,6 +11,7 @@ import https from 'node:https';
 import dgram from 'node:dgram';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { execFile } from 'node:child_process';
+import { stripVTControlCharacters } from 'node:util';
 
 const [installation, extracted, evidenceDirectory] = process.argv.slice(2);
 if (process.platform !== 'win32' || process.arch !== 'x64')
@@ -84,7 +85,9 @@ const digest = async (file) => {
 };
 const report = {
   diagnosticOnly: process.env.LABSNRACKS_DIAGNOSTIC_PATCH === 'true',
-  serialInput: diagnosticCrLf ? 'CRLF diagnostic workaround' : 'raw CR through installed adapter',
+  serialInput: diagnosticCrLf
+    ? 'CRLF paced 2ms diagnostic workaround'
+    : 'raw CR through installed adapter',
   schemaVersion: 1,
   platform: process.platform,
   arch: process.arch,
@@ -100,6 +103,7 @@ const report = {
   },
 };
 let engine;
+let lastCommand;
 const buffers = new Map();
 const states = new Map();
 const errors = new Map();
@@ -219,11 +223,19 @@ try {
       }
       throw new Error('Guest serial command/readiness deadline expired.');
     };
+    const send = async (id, input) => {
+      if (diagnosticCrLf) {
+        for (const character of input) {
+          engine.sendConsole(id, character);
+          await sleep(2);
+        }
+      } else engine.sendConsole(id, input);
+    };
     const ready = async (id) => {
       await wait(id, /Please press Enter|root@OpenWrt/);
       for (let n = 0; n < 180; n++) {
         if (/root@OpenWrt/.test(buffers.get(id) ?? '')) return;
-        engine.sendConsole(id, enter);
+        await send(id, enter);
         await sleep(1000);
       }
       throw new Error('OpenWrt shell did not become ready.');
@@ -291,6 +303,20 @@ try {
     }
   }
 } catch (error) {
+  if (lastCommand) {
+    const observed = buffers.get(lastCommand.id) ?? '';
+    const flat = stripVTControlCharacters(observed).replace(/[\r\n]/g, '');
+    report.commandObservation = {
+      echoedMarkerArgument: flat.includes(lastCommand.marker),
+      echoedCommand: flat.includes(lastCommand.text),
+      returnValues: [
+        ...observed.matchAll(new RegExp(`LR_${lastCommand.marker}_RC=(\\d+)_END`, 'g')),
+      ].map((m) => m[1]),
+      shellError: /not found|syntax error|unexpected/.test(flat),
+      carriageReturns: (observed.match(/\r/g) ?? []).length,
+      lineFeeds: (observed.match(/\n/g) ?? []).length,
+    };
+  }
   report.serialMarkers = [...buffers.values()].map((text) => ({
     bufferedCharacters: text.length,
     pressEnter: /Please press Enter/.test(text),
