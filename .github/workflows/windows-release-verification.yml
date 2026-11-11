@@ -184,10 +184,23 @@ jobs:
           )
           foreach ($runtime in $runtimeChecks) {
             $file = Join-Path $installDir $runtime.Path
+            $binaryName = [IO.Path]::GetFileName($file)
+            Write-Host "Checking bundled runtime: $binaryName"
             $out = Join-Path $qa ([IO.Path]::GetFileName($file) + '.stdout.txt')
             $err = Join-Path $qa ([IO.Path]::GetFileName($file) + '.stderr.txt')
-            $probe = Start-Process -FilePath $file -ArgumentList '--version' -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
-            if (-not $probe.WaitForExit(20000)) { Stop-Process -Id $probe.Id -Force; throw 'Bundled runtime version probe timed out' }
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            $probe = Start-Process -FilePath $file -ArgumentList '--version' -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+            if (-not $probe.WaitForExit(90000)) {
+              $ownedProbe = Get-Process -Id $probe.Id -ErrorAction SilentlyContinue
+              $moduleNames = @()
+              try { $moduleNames = @($ownedProbe.Modules | Select-Object -First 128 | ForEach-Object { $_.ModuleName }) } catch {}
+              $title = if ($ownedProbe) { ($ownedProbe.MainWindowTitle -replace '[\x00-\x1f]', ' ') } else { '' }
+              if ($title.Length -gt 256) { $title = $title.Substring(0, 256) }
+              @{ binary = $binaryName; status = 'timeout'; elapsedMs = $timer.ElapsedMilliseconds; ownedWindowTitle = $title; loadedModuleNames = $moduleNames } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $qa ($binaryName + '.probe.json')) -Encoding utf8
+              Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue
+              throw "Bundled runtime version probe timed out after 90 seconds: $binaryName"
+            }
+            @{ binary = $binaryName; status = 'exited'; elapsedMs = $timer.ElapsedMilliseconds; exitCode = $probe.ExitCode } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $qa ($binaryName + '.probe.json')) -Encoding utf8
             if ($probe.ExitCode -notin @(0, 1) -or ($runtime.Path -notlike '*dynamips.exe' -and $probe.ExitCode -ne 0)) { throw 'Bundled runtime version probe failed' }
             $text = (Get-Content $out -Raw) + (Get-Content $err -Raw)
             if ($text -notmatch $runtime.Pattern) { throw "Bundled runtime did not identify itself: $($runtime.Path)" }
