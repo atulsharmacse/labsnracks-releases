@@ -5,7 +5,7 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
-import { createGunzip } from 'node:zlib';
+import { decodePinnedGzipImage } from './gzip-image.mjs';
 import { pipeline } from 'node:stream/promises';
 import https from 'node:https';
 import dgram from 'node:dgram';
@@ -130,21 +130,7 @@ try {
   await pipeline(response, bounded, createWriteStream(compressed, { flags: 'wx' }));
   if ((await digest(compressed)) !== publisherSha256)
     throw new Error('OpenWrt publisher SHA-256 mismatch.');
-  let expanded = 0;
-  const boundedDisk = async function* (chunks) {
-    for await (const chunk of chunks) {
-      expanded += chunk.length;
-      if (expanded > 256 * 1024 * 1024)
-        throw new Error('OpenWrt expanded disk exceeded its bound.');
-      yield chunk;
-    }
-  };
-  await pipeline(
-    createReadStream(compressed),
-    createGunzip(),
-    boundedDisk,
-    createWriteStream(source, { flags: 'wx' }),
-  );
+  report.imageDecoding = await decodePinnedGzipImage(compressed, source, publisherSha256);
   const originalHash = await digest(source);
   const { QemuImages, QemuEngine } = await import(
     pathToFileURL(path.join(extracted, 'dist-electron/electron/qemu.js')).href
