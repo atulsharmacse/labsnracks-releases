@@ -240,13 +240,16 @@ try {
       }
       throw new Error('OpenWrt shell did not become ready.');
     };
-    const command = async (id, text) => {
+    const command = async (id, text, timeout = 30000) => {
       const marker = randomUUID().replaceAll('-', '');
       buffers.set(id, '');
       lastCommand = { id, marker, text };
-      await send(id, `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s_END\\n' ${marker} "$r"${enter}`);
+      const input = `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s_END\\n' ${marker} "$r"${enter}`;
+      if (Buffer.byteLength(input) > 400)
+        throw new Error('Split fixture commands below the guest interactive line limit.');
+      await send(id, input);
       const proof = new RegExp(`LR_${marker}_RC=(\\d+)_END`);
-      await wait(id, proof, 30000);
+      await wait(id, proof, timeout);
       const output = buffers.get(id) ?? '';
       if (proof.exec(output)?.[1] !== '0') throw new Error('Guest command failed.');
       report.completedCommands = (report.completedCommands ?? 0) + 1;
@@ -259,6 +262,42 @@ try {
     report.stage = 'serial-shell-readiness';
     await Promise.all([ready(one.id), ready(two.id)]);
     report.checks.qemu = 'passed';
+    report.stage = 'isolated-guest-firewall-fixture';
+    report.fixtureFirewall = [];
+    for (const [guest, own, peer] of [
+      [one, '10.44.0.1', '10.44.0.2'],
+      [two, '10.44.0.2', '10.44.0.1'],
+    ]) {
+      const commands = [
+        'for i in $(seq 1 60); do nft list chain inet fw4 input >/dev/null 2>&1 && break; sleep 1; done; nft list chain inet fw4 input',
+        'uci set firewall.cns_capture=zone; uci set firewall.cns_capture.name=cns_capture; uci set firewall.cns_capture.device=eth2',
+        'uci set firewall.cns_capture.input=REJECT; uci set firewall.cns_capture.output=ACCEPT; uci set firewall.cns_capture.forward=REJECT',
+        'uci set firewall.cns_capture_ping=rule; uci set firewall.cns_capture_ping.name=CNS-isolated-QA-ping; uci set firewall.cns_capture_ping.src=cns_capture',
+        'uci set firewall.cns_capture_ping.proto=icmp; uci set firewall.cns_capture_ping.icmp_type=echo-request; uci set firewall.cns_capture_ping.family=ipv4',
+        `uci set firewall.cns_capture_ping.src_ip=${peer}; uci set firewall.cns_capture_ping.dest_ip=${own}; uci set firewall.cns_capture_ping.target=ACCEPT`,
+        'uci commit firewall; /etc/init.d/firewall restart; nft list chain inet fw4 input_cns_capture',
+      ];
+      let generated = '';
+      for (const text of commands) generated = await command(guest.id, text, 90000);
+      if (
+        !generated.includes(`ip saddr ${peer} ip daddr ${own} icmp type echo-request`) ||
+        !/counter packets [0-9]+ bytes [0-9]+ accept comment "!fw4: CNS-isolated-QA-ping"/.test(
+          generated,
+        ) ||
+        !generated.includes('jump reject_from_cns_capture')
+      )
+        throw new Error(
+          'The isolated guest fixture lacks its exact peer ICMP rule and reject fallback.',
+        );
+      report.fixtureFirewall.push({
+        interface: 'eth2',
+        sourceIP: peer,
+        destinationIP: own,
+        protocol: 'IPv4 ICMP echo-request',
+        narrowAcceptVerified: true,
+        rejectFallbackVerified: true,
+      });
+    }
     report.stage = 'address-and-packet-proof';
     await command(
       one.id,
