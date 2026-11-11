@@ -10,10 +10,59 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import dgram from 'node:dgram';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { execFile } from 'node:child_process';
 
 const [installation, extracted, evidenceDirectory] = process.argv.slice(2);
 if (process.platform !== 'win32' || process.arch !== 'x64')
   throw new Error('This qualification script requires a native Windows x64 host.');
+if (process.argv[2] === '--probe-runtime') {
+  const binary = process.argv[3],
+    directory = process.argv[4];
+  if (!binary || !directory)
+    throw new Error('Runtime probe requires binary and evidence directory.');
+  const name = path.basename(binary);
+  if (!['qemu-system-x86_64.exe', 'qemu-img.exe', 'dynamips.exe'].includes(name))
+    throw new Error('Unsupported runtime probe binary.');
+  const started = Date.now();
+  // Match QemuImages.checkRuntime's execFile transport and 30-second deadline.
+  const result = await new Promise((resolve) => {
+    execFile(
+      binary,
+      ['--version'],
+      { timeout: 30000, maxBuffer: 16384 },
+      (error, stdout, stderr) => {
+        const code = error ? error.code : 0;
+        const pattern = name.startsWith('dynamips')
+          ? /Dynamips|Cisco Router Simulation Platform/i
+          : name.startsWith('qemu-img')
+            ? /qemu-img version/i
+            : /QEMU emulator version/i;
+        resolve({
+          binary: name,
+          transport: 'node.execFile',
+          timeoutMs: 30000,
+          elapsedMs: Date.now() - started,
+          exitCode: code,
+          killed: !!error?.killed,
+          passed:
+            (code === 0 || (name.startsWith('dynamips') && code === 1)) &&
+            pattern.test(stdout + stderr),
+          stdout,
+          stderr,
+        });
+      },
+    );
+  });
+  const { stdout, stderr, ...metadata } = result;
+  await fs.writeFile(path.join(directory, name + '.node.stdout.txt'), stdout);
+  await fs.writeFile(path.join(directory, name + '.node.stderr.txt'), stderr);
+  await fs.writeFile(
+    path.join(directory, name + '.node-probe.json'),
+    JSON.stringify(metadata, null, 2),
+  );
+  console.log(`Adapter-faithful runtime probe ${name}: ${metadata.passed ? 'passed' : 'failed'}`);
+  process.exit(metadata.passed ? 0 : 1);
+}
 if (!installation || !extracted || !evidenceDirectory)
   throw new Error('Usage: node windows-qemu-smoke.mjs INSTALL_DIR EXTRACTED_ASAR EVIDENCE_DIR');
 const root = await fs.mkdtemp(path.join(path.resolve(evidenceDirectory), 'qemu-native-'));
