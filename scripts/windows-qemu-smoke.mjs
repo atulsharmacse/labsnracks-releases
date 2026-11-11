@@ -243,7 +243,8 @@ try {
     const command = async (id, text) => {
       const marker = randomUUID().replaceAll('-', '');
       buffers.set(id, '');
-      engine.sendConsole(
+      lastCommand = { id, marker, text };
+      await send(
         id,
         `( ${text} ); r=$?; printf '\\nLR_%s_RC=%s_END\\n' ${marker} "$r"${enter}`,
       );
